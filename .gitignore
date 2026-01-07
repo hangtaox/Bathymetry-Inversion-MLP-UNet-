@@ -1,0 +1,22 @@
+# 数据文件
+data/
+processed_data/
+*.img
+*.zip
+*.pdf
+
+code/
+.python
+
+# 检查点和临时文件
+checkpoints/
+tmp_img/
+
+
+# IDE
+.vscode/
+.idea/
+
+# 日志文件
+*.log
+improve.txt
