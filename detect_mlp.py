@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from pathlib import Path
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -206,12 +207,10 @@ def main_inference():
     
     # 路径配置
     PATHS = {
-        "grav_path": r"D:\project\filtered_gravity_bandpass.nc",
-        "gebco_path": r"D:\project\data\GEBCO_2024\gebco_2024\GEBCO_2024.nc",
-        "curv_path": r"D:\project\filtered_curvature_bandpass.nc",
-        "topo_path": r"D:\project\data\topo_25.1\topo_25.1.nc",
+        "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
+        "gebco_path": Path("./data\GEBCO_2024\gebco_2024\GEBCO_2024.nc"),
+        "curv_path": Path("./data/SWOT/curv_SWOT_02.nc")
     }
-    
     LON_RANGE = (112, 114)
     LAT_RANGE = (15, 18)
     
@@ -232,7 +231,7 @@ def main_inference():
     
     # 2. 加载模型
     print("\n加载模型...")
-    model_path = "./checkpoints/bathymetry_mlp_best.pt"
+    model_path = "./checkpoints/mlp/bathymetry_mlp_best.pt"
     checkpoint = torch.load(model_path, map_location='cpu')
     
     # 关键：模型输入维度必须是4
