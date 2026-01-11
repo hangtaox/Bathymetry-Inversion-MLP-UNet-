@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xarray as xr
 from tqdm import tqdm
+from pathlib import Path
 
 from data.dataset import BathymetryPatchDataset
 from models.UNet import BathymetryUNet
@@ -15,11 +16,10 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 PATHS = {
-    "grav_path": r"D:\project\filtered_gravity_bandpass.nc",
-    "gebco_path": r"D:\project\data\GEBCO_2024\gebco_2024\GEBCO_2024.nc",
-    "curv_path": r"D:\project\filtered_curvature_bandpass.nc"
+    "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
+    "gebco_path": Path("./data\GEBCO_2024\gebco_2024\GEBCO_2024.nc"),
+    "curv_path": Path("./data/SWOT/curv_SWOT_02.nc")
 }
-
 LON_RANGE = (112, 114)
 LAT_RANGE = (15, 18)
 

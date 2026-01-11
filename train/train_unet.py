@@ -4,6 +4,15 @@ import numpy as np
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import os
+import sys
+from pathlib import Path
+# 获取当前脚本所在目录（train/）
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取项目根目录（当前脚本的父目录）
+project_root = os.path.dirname(current_dir)
+# 将项目根目录添加到模块搜索路径
+sys.path.insert(0, project_root)
 
 from data.dataset import BathymetryPatchDataset
 from models.UNet import BathymetryUNet
@@ -14,11 +23,10 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 PATHS = {
-    "grav_path": r"D:\project\filtered_gravity_bandpass.nc",
-    "gebco_path": r"D:\project\data\GEBCO_2024\gebco_2024\GEBCO_2024.nc",
-    "curv_path": r"D:\project\filtered_curvature_bandpass.nc"
+    "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
+    "gebco_path": Path("./data\GEBCO_2024\gebco_2024\GEBCO_2024.nc"),
+    "curv_path": Path("./data/SWOT/curv_SWOT_02.nc")
 }
-
 LON_RANGE = (112, 114)
 LAT_RANGE = (15, 18)
 
