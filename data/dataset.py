@@ -156,7 +156,7 @@ class BathymetryPointDataset(Dataset):
         """将归一化的水深转换回原始值"""
         return y_norm * self.y_std + self.y_mean
 
-# UNet网络的数据读取（得到矩阵）
+# UNet网络的训练用数据读取（得到矩阵）
 class BathymetryPatchDataset(Dataset):
     """
     UNet 用 Patch Dataset
@@ -169,6 +169,7 @@ class BathymetryPatchDataset(Dataset):
         grav_path,
         curv_path,
         gebco_path,
+        h_mlp_path,
         lon_range=(110, 114),
         lat_range=(15, 18),
         patch_size=64,
@@ -179,7 +180,7 @@ class BathymetryPatchDataset(Dataset):
         downsample_method="mean"
     ):
         super().__init__()
-        self.split = split
+
         # ------------------
         # 1. 读取重力数据（带坐标）
         # ------------------
@@ -195,7 +196,10 @@ class BathymetryPatchDataset(Dataset):
         lon = grav_da["lon"].values
         lat = grav_da["lat"].values
         lon_grid, lat_grid = np.meshgrid(lon, lat)
-
+        
+        self.lons = lon
+        self.lats = lat
+        
         self.lon = lon_grid
         self.lat = lat_grid
 
@@ -227,6 +231,13 @@ class BathymetryPatchDataset(Dataset):
             method=downsample_method
         )
 
+        ds_mlp = xr.open_dataset(h_mlp_path)
+        self.h_base = ds_mlp["predicted_depth"].sel(
+            lon=slice(*lon_range),
+            lat=slice(*lat_range)
+        ).values
+        ds_mlp.close()
+         
         self.H, self.W = self.grav.shape
 
         # ------------------
@@ -236,17 +247,27 @@ class BathymetryPatchDataset(Dataset):
             # 重力 & 梯度
             self.grav_mean = self.grav.mean()
             self.grav_std = self.grav.std() + 1e-6
+            
             self.curv_mean = self.curv.mean()
             self.curv_std = self.curv.std() + 1e-6
+            
+            self.h_base_mean = self.h_base.mean()
+            self.h_base_std = self.h_base.std() + 1e-6
+            
 
             self.grav = (self.grav - self.grav_mean) / self.grav_std
             self.curv = (self.curv - self.curv_mean) / self.curv_std
 
-            # 水深
-            self.gebco_mean = self.gebco.mean()
-            self.gebco_std = self.gebco.std() + 1e-6
-            self.gebco = (self.gebco - self.gebco_mean) / self.gebco_std
-
+            self.residual = self.gebco - self.h_base 
+            # 长波分量
+            self.h_base = (self.h_base - self.h_base_mean) / self.h_base_std
+            
+            
+            # 水深残差
+            self.residual_mean = self.residual.mean()
+            self.residual_std = self.residual.std() + 1e-6
+            self.residual = (self.residual - self.residual_mean) / self.residual_std
+            
             # ===== 新增：经纬度归一化 =====
             lon_min, lon_max = lon_range
             lat_min, lat_max = lat_range
@@ -295,46 +316,24 @@ class BathymetryPatchDataset(Dataset):
 
     def __getitem__(self, idx):
         i, j = self.patch_coords[idx]
-        
-        # 获取原始patch
+
         grav_patch = self.grav[i:i+self.patch_size, j:j+self.patch_size]
         curv_patch = self.curv[i:i+self.patch_size, j:j+self.patch_size]
-        lon_patch = self.lon[i:i+self.patch_size, j:j+self.patch_size]
-        lat_patch = self.lat[i:i+self.patch_size, j:j+self.patch_size]
-        gebco_patch = self.gebco[i:i+self.patch_size, j:j+self.patch_size]
-        
-        # 只在训练时进行增强
-        if self.split == "train":
-            # 随机水平翻转（50%概率）
-            if np.random.rand() > 0.5:
-                grav_patch = np.fliplr(grav_patch).copy()
-                curv_patch = np.fliplr(curv_patch).copy()
-                lon_patch = np.fliplr(lon_patch).copy()
-                lat_patch = np.fliplr(lat_patch).copy()
-                gebco_patch = np.fliplr(gebco_patch).copy()
-            
-            # 随机垂直翻转（50%概率）
-            if np.random.rand() > 0.5:
-                grav_patch = np.flipud(grav_patch).copy()
-                curv_patch = np.flipud(curv_patch).copy()
-                lon_patch = np.flipud(lon_patch).copy()
-                lat_patch = np.flipud(lat_patch).copy()
-                gebco_patch = np.flipud(gebco_patch).copy()
-            
-            # 随机90度旋转（0, 90, 180, 270度）
-            k = np.random.randint(0, 4)  # 0,1,2,3
-            if k > 0:
-                grav_patch = np.rot90(grav_patch, k).copy()
-                curv_patch = np.rot90(curv_patch, k).copy()
-                lon_patch = np.rot90(lon_patch, k).copy()
-                lat_patch = np.rot90(lat_patch, k).copy()
-                gebco_patch = np.rot90(gebco_patch, k).copy()
-        
-        # 堆叠输入通道
-        x = np.stack([grav_patch, curv_patch, lon_patch, lat_patch], axis=0)
-        y = gebco_patch[None, :, :]
-        
-        # 关键修复：确保返回元组 (x, y)
+        lon_patch  = self.lon[i:i+self.patch_size, j:j+self.patch_size]
+        lat_patch  = self.lat[i:i+self.patch_size, j:j+self.patch_size]
+
+        residual_patch = self.residual[i:i+self.patch_size, j:j+self.patch_size]
+        h_base_patch = self.h_base[i:i+self.patch_size, j:j+self.patch_size]
+        # ===== 输入 4 通道 =====
+        x = np.stack(
+            [grav_patch, curv_patch, lon_patch, lat_patch, h_base_patch],
+            # [grav_patch, curv_patch],
+            axis=0
+        )   # [4, H, W]
+
+        delta = residual_patch
+        y = delta[None, :, :]
+
         return (
             torch.tensor(x, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32)
@@ -366,3 +365,90 @@ class BathymetryPatchDataset(Dataset):
 
         else:
             raise ValueError(f"Unknown downsample method: {method}")
+
+class BathymetryInferencePatchDataset(Dataset):
+    def __init__(
+        self,
+        grav_path,
+        curv_path,
+        h_mlp_path,
+        lon_range,
+        lat_range,
+        patch_size=64,
+        stride=32,
+        normalize=True,
+        stats_path=None
+    ):
+        self.patch_size = patch_size
+        self.stride = stride
+        self.normalize = normalize
+
+        # ---------- 读取数据 ----------
+        ds_grav = xr.open_dataset(grav_path)
+        ds_curv = xr.open_dataset(curv_path)
+        ds_mlp  = xr.open_dataset(h_mlp_path)
+
+        grav = ds_grav['z'].sel(lon=slice(*lon_range), lat=slice(*lat_range)).values
+        curv = ds_curv['z'].sel(lon=slice(*lon_range), lat=slice(*lat_range)).values
+        h_mlp = ds_mlp['predicted_depth'].values
+
+        self.lons = ds_grav['lon'].sel(lon=slice(*lon_range)).values
+        self.lats = ds_grav['lat'].sel(lat=slice(*lat_range)).values
+
+        ds_grav.close()
+        ds_curv.close()
+        ds_mlp.close()
+
+        H, W = grav.shape
+        self.H, self.W = H, W
+
+        # ---------- 坐标通道 ----------
+        lon_grid, lat_grid = np.meshgrid(self.lons, self.lats)
+        
+        lon_min, lon_max = lon_range
+        lat_min, lat_max = lat_range
+        
+        # ---------- 归一化 ----------
+        if normalize and stats_path is not None:
+            stats = np.load(stats_path)
+            grav = (grav - stats['grav_mean']) / stats['grav_std']
+            curv = (curv - stats['curv_mean']) / stats['curv_std']
+            h_mlp = (h_mlp - stats['h_base_mean']) / stats['h_base_std']
+            lon_grid = (lon_grid - lon_min) / (lon_max - lon_min)
+            lat_grid = (lat_grid - lat_min) / (lat_max - lat_min)
+        self.inputs = np.stack(
+            [grav, curv, lon_grid, lat_grid, h_mlp],
+            axis=0
+        )  # (5, H, W)
+
+        # ---------- patch 坐标 ----------
+        self.patch_coords = []
+
+        # 常规 patch
+        for i in range(0, H - patch_size + 1, stride):
+            for j in range(0, W - patch_size + 1, stride):
+                self.patch_coords.append((i, j))
+
+        # ===== 补最下面一行 =====
+        if (H - patch_size) % stride != 0:
+            i = H - patch_size
+            for j in range(0, W - patch_size + 1, stride):
+                self.patch_coords.append((i, j))
+
+        # ===== 补最右一列 =====
+        if (W - patch_size) % stride != 0:
+            j = W - patch_size
+            for i in range(0, H - patch_size + 1, stride):
+                self.patch_coords.append((i, j))
+
+        # ===== 补右下角 =====
+        if (H - patch_size) % stride != 0 and (W - patch_size) % stride != 0:
+            self.patch_coords.append((H - patch_size, W - patch_size))
+
+    def __len__(self):
+        return len(self.patch_coords)
+
+    def __getitem__(self, idx):
+        i, j = self.patch_coords[idx]
+        x = self.inputs[:, i:i+self.patch_size, j:j+self.patch_size]
+        return torch.from_numpy(x).float()

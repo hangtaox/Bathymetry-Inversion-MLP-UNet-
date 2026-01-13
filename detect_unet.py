@@ -8,7 +8,7 @@ import xarray as xr
 from tqdm import tqdm
 from pathlib import Path
 
-from data.dataset import BathymetryPatchDataset
+from data.dataset import BathymetryInferencePatchDataset
 from models.UNet import BathymetryUNet
 
 # 设置中文字体
@@ -18,47 +18,112 @@ plt.rcParams['axes.unicode_minus'] = False
 PATHS = {
     "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
     "gebco_path": Path("./data\GEBCO_2024\gebco_2024\GEBCO_2024.nc"),
-    "curv_path": Path("./data/SWOT/curv_SWOT_02.nc")
+    "curv_path": Path("./data/SWOT/curv_SWOT_02.nc"),
+    "h_mlp_path": Path("./tmp_img/mlp_prediction.nc")
 }
 LON_RANGE = (112, 114)
-LAT_RANGE = (15, 18)
+LAT_RANGE = (15, 18) 
 
-
-def infer_unet_full_map_v2(model, dataset, device="cuda"):
+def make_gaussian_weight(patch_size, sigma_ratio=0.25):
     """
-    优化版本：用 enumerate + dataset.patch_coords 获得 patch 坐标，
-    完整实现滑窗推理及拼接（覆盖计数平均）
+    生成中心高、边缘低的 2D Gaussian 权重
     """
+    ax = np.linspace(-(patch_size - 1) / 2., (patch_size - 1) / 2., patch_size)
+    xx, yy = np.meshgrid(ax, ax)
+    sigma = patch_size * sigma_ratio
+    weight = np.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+    weight = weight / weight.max()
+    return weight.astype(np.float32)
 
+
+def infer_unet_full_map_v2(
+    model,
+    dataset,
+    residual_mean,
+    residual_std,
+    device="cuda"
+):
     model.eval()
 
     H, W = dataset.H, dataset.W
     patch_size = dataset.patch_size
-    stride = dataset.stride
 
     pred_sum = np.zeros((H, W), dtype=np.float32)
     pred_count = np.zeros((H, W), dtype=np.float32)
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    weight = make_gaussian_weight(patch_size)
 
     with torch.no_grad():
-        for idx, (x, y) in enumerate(tqdm(loader, desc="UNet 推理", ncols=100)):
+        for idx, x in enumerate(tqdm(loader)):
             x = x.to(device)
             pred = model(x).squeeze().cpu().numpy()
 
             i, j = dataset.patch_coords[idx]
-            pred_sum[i:i + patch_size, j:j + patch_size] += pred
-            pred_count[i:i + patch_size, j:j + patch_size] += 1
+            pred_sum[i:i+patch_size, j:j+patch_size] += pred * weight
+            pred_count[i:i+patch_size, j:j+patch_size] += weight
 
-    # 防止除零
     pred_count[pred_count == 0] = 1
-    pred_full = pred_sum / pred_count
+    residual_full = pred_sum / pred_count
 
-    # 反归一化
-    pred_full = pred_full * dataset.gebco_std + dataset.gebco_mean
+    # 反归一化 residual
+    residual_full = residual_full * residual_std + residual_mean
+    return residual_full
 
-    return pred_full
 
+def evaluate_and_visualize_residual(residual_pred, residual_true):
+    """
+    评估残差预测的精度并可视化结果
+    residual_pred: 预测残差 (numpy 2D)
+    residual_true: 真实残差 (numpy 2D)
+    """
+    # 取有效区域
+    mask = ~np.isnan(residual_pred) & ~np.isnan(residual_true)
+    pred = residual_pred[mask]
+    true = residual_true[mask]
+
+    # 计算指标
+    mae = mean_absolute_error(true, pred)
+    rmse = np.sqrt(mean_squared_error(true, pred))
+    r2 = r2_score(true, pred)
+    bias = np.mean(pred - true)
+    std = np.std(pred - true)
+    corr = np.corrcoef(true, pred)[0, 1]
+
+    # 可视化
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+    vmin = min(np.nanmin(residual_pred), np.nanmin(residual_true))
+    vmax = max(np.nanmax(residual_pred), np.nanmax(residual_true))
+
+    axs[0].imshow(residual_pred, cmap='RdBu_r', vmin=vmin, vmax=vmax)
+    axs[0].set_title("预测残差")
+    plt.colorbar(axs[0].imshow(residual_pred, cmap='RdBu_r', vmin=vmin, vmax=vmax), ax=axs[0])
+
+    axs[1].imshow(residual_true, cmap='RdBu_r', vmin=vmin, vmax=vmax)
+    axs[1].set_title("真实残差")
+    plt.colorbar(axs[1].imshow(residual_true, cmap='RdBu_r', vmin=vmin, vmax=vmax), ax=axs[1])
+
+    axs[2].scatter(true, pred, alpha=0.3, s=5)
+    minv = min(true.min(), pred.min())
+    maxv = max(true.max(), pred.max())
+    axs[2].plot([minv, maxv], [minv, maxv], 'r--')
+    axs[2].set_title(f"散点图\nR²={r2:.3f}  Corr={corr:.3f}")
+    axs[2].set_xlabel("真实残差")
+    axs[2].set_ylabel("预测残差")
+
+    plt.tight_layout()
+    plt.show()
+
+    # 返回指标字典
+    return {
+        "MAE": mae,
+        "RMSE": rmse,
+        "R2": r2,
+        "Bias": bias,
+        "Std": std,
+        "Correlation": corr
+    }
 
 def calculate_errors(pred, target, region_name=""):
     """计算误差指标"""
@@ -176,26 +241,26 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("加载数据集...")
-    dataset = BathymetryPatchDataset(
+    dataset = BathymetryInferencePatchDataset(
         grav_path=PATHS["grav_path"],
         curv_path=PATHS["curv_path"],
-        gebco_path=PATHS["gebco_path"],
+        h_mlp_path=PATHS["h_mlp_path"],
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
         patch_size=64,
         stride=32,
         normalize=True,
-        split="all",
-        downsample_method='median',
+        stats_path="./checkpoints./unet/residual_norm_stats.npz"
     )
 
     print(f"样本数（patch数）: {len(dataset)}")
 
     print("加载模型...")
-    model = BathymetryUNet(in_channels=2, out_channels=1, base_ch=32)
+    model = BathymetryUNet(in_channels=5, out_channels=1, base_ch=32)
     model.load_state_dict(torch.load("./checkpoints./unet/bathymetry_unet_best.pt", map_location=device))
     model.to(device)
     model.eval()
+
 
     print("加载真实水深数据...")
     ds_topo = xr.open_dataset(PATHS["gebco_path"])
@@ -214,17 +279,77 @@ def main():
     print(f"真实水深数据形状: {topo_data.shape}")
 
     print("开始推理...")
-    pred_grid = infer_unet_full_map_v2(model, dataset, device)
+
+    stats = np.load("./checkpoints./unet/residual_norm_stats.npz")
+
+    residual_full = infer_unet_full_map_v2(
+        model,
+        dataset,
+        residual_mean=stats["residual_mean"],
+        residual_std=stats["residual_std"],
+        device=device
+    )
+    
+    ds_mlp = xr.open_dataset(PATHS["h_mlp_path"])
+    h_mlp_full = ds_mlp['predicted_depth'].values
+    ds_mlp.close()
+
+    pred_grid = h_mlp_full + residual_full
+
+    residual_true = topo_data - h_mlp_full
+    
+    residual_metrics = evaluate_and_visualize_residual(residual_full, residual_true)
+    
+    print(residual_metrics)
 
     print("计算误差...")
     errors = calculate_errors(pred_grid, topo_data, "UNet 全区域")
 
     print("绘制结果...")
     visualize_comparison(pred_grid, topo_data, errors)
+    
+    # 获取一维经纬度数组
+    pred_lons = dataset.lons  # 一维数组，形状: (W,)
+    pred_lats = dataset.lats  # 一维数组，形状: (H,)
+    
+    # 创建xarray Dataset
+    ds_residual = xr.Dataset(
+        {
+            "predicted_depth": (["lat", "lon"], residual_full),
+        },
+        coords={
+            "lon": pred_lons,
+            "lat": pred_lats
+        },
+        attrs={
+            "description": "UNet模型预测的mlp与gebco的残差",
+            "model": "Unet"
+        }
+    )
+    # 5. 保存结果
+    output_path = "./tmp_img/residual_full_prediction.nc"
+    ds_residual.to_netcdf(output_path, mode='w')
 
-    print("保存预测结果...")
-    np.save('./tmp_img/unet_predicted_bathymetry.npy', pred_grid)
-    np.save('./tmp_img/unet_true_bathymetry.npy', topo_data)
+    ds_pred = xr.Dataset(
+        {
+            "predicted_depth": (["lat", "lon"], pred_grid),
+        },
+        coords={
+            "lon": pred_lons,
+            "lat": pred_lats
+        },
+        attrs={
+            "description": "Unet模型预测的残差加上MLP的预测结果修正的海底地形深度",
+            "model": "Unet"
+        }
+    )
+    # 5. 保存结果
+    output_path = "./tmp_img/all_prediction.nc"
+    ds_pred.to_netcdf(output_path, mode='w')
+
+
+    # print("保存预测结果...")
+    # np.save('./tmp_img/unet_prediction.npy', pred_grid)
 
     print("推理完成。")
 
