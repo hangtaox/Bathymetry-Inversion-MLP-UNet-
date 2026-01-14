@@ -211,8 +211,8 @@ def main_inference():
         "gebco_path": Path("./data\GEBCO_2024\gebco_2024\GEBCO_2024.nc"),
         "curv_path": Path("./data/SWOT/curv_SWOT_02.nc")
     }
-    LON_RANGE = (112, 114)
-    LAT_RANGE = (15, 18)
+    LON_RANGE = (112, 117)
+    LAT_RANGE = (12, 17) 
     
     # 1. 加载数据集获取归一化参数
     print("加载数据集...")
@@ -274,14 +274,32 @@ def main_inference():
     print("\n开始推理...")
     pred_grid, errors = compare_with_topo(model, dataset, topo_data, device)
     
+    pred_lons = dataset.lons  # 经度坐标
+    pred_lats = dataset.lats  # 纬度坐标
+    
+    # 创建xarray Dataset
+    ds_pred = xr.Dataset(
+        {
+            "predicted_depth": (["lat", "lon"], pred_grid),
+        },
+        coords={
+            "lon": pred_lons,
+            "lat": pred_lats
+        },
+        attrs={
+            "description": "MLP模型预测的海底地形深度",
+            "model": "ResidualMLP"
+        }
+    )
     # 5. 保存结果
-    np.save('./tmp_img/predicted_bathymetry.npy', pred_grid)
-    np.save('./tmp_img/true_bathymetry.npy', topo_data)
+    output_path = "./tmp_img/mlp_prediction.nc"
+    ds_pred.to_netcdf(output_path, mode='w')
+
     
     print("\n" + "="*50)
     print("推理完成!")
-    print(f"预测结果保存至: ./tmp_img/predicted_bathymetry.npy")
-    print(f"对比图保存至: ./tmp_img/topo_comparison.png")
+    print(f"预测结果保存至: ./tmp_img/mlp_predicted.nc")
+    print(f"对比图保存至: ./tmp_img/gebco_comparison.png")
     
     return pred_grid, errors
 

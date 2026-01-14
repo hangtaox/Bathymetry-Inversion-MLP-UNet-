@@ -156,7 +156,7 @@ class BathymetryPointDataset(Dataset):
         """将归一化的水深转换回原始值"""
         return y_norm * self.y_std + self.y_mean
 
-# UNet网络的训练用数据读取（得到矩阵）
+# UNet残差网络的训练用数据读取（得到矩阵）
 class BathymetryPatchDataset(Dataset):
     """
     UNet 用 Patch Dataset
@@ -366,6 +366,7 @@ class BathymetryPatchDataset(Dataset):
         else:
             raise ValueError(f"Unknown downsample method: {method}")
 
+# UNet残差网络的推理用数据读取（得到矩阵）
 class BathymetryInferencePatchDataset(Dataset):
     def __init__(
         self,
@@ -452,3 +453,367 @@ class BathymetryInferencePatchDataset(Dataset):
         i, j = self.patch_coords[idx]
         x = self.inputs[:, i:i+self.patch_size, j:j+self.patch_size]
         return torch.from_numpy(x).float()
+
+# unet绝对深度网络的训练用数据读取
+class BathymetryDataset(Dataset):
+    """
+    UNet用Patch Dataset
+    输入: [5, H, W] (重力, 梯度, lon, lat, h_mlp)
+    输出: [1, H, W] (水深绝对深度)
+    """
+
+    def __init__(
+        self,
+        grav_path,
+        curv_path,
+        gebco_path,
+        h_mlp_path,
+        lon_range=(110, 114),
+        lat_range=(15, 18),
+        patch_size=64,
+        stride=32,
+        split="train",
+        split_ratio=0.8,
+        normalize=True,
+        stats_path=None,
+        downsample_method="mean"  # 新增：下采样方法
+    ):
+        super().__init__()
+        
+        # 读取重力数据（基准网格）
+        self.grav = self._read_data(grav_path, "z", lon_range, lat_range)
+        self.H, self.W = self.grav.shape
+        
+        # 读取其他数据
+        self.curv = self._read_data(curv_path, "z", lon_range, lat_range)
+        self.h_mlp = self._read_data(h_mlp_path, "predicted_depth", lon_range, lat_range)
+        
+        # 读取GEBCO数据并下采样到与重力数据相同的分辨率
+        self.depth = self._read_and_downsample_gebco(
+            gebco_path, 
+            "elevation", 
+            lon_range, 
+            lat_range, 
+            target_shape=(self.H, self.W),
+            method=downsample_method
+        )
+        
+        # 验证所有数据形状一致
+        self._validate_shapes()
+        
+        # 获取经纬度网格
+        self._create_lonlat_grid(lon_range, lat_range)
+        
+        # 归一化
+        if normalize:
+            if stats_path:  # 使用预计算的统计信息
+                self._load_normalize_stats(stats_path, lon_range, lat_range)
+            else:  # 从当前数据计算统计信息
+                self._compute_normalize_stats(lon_range, lat_range)
+        
+        # 生成patch坐标
+        self.patch_size = patch_size
+        self.patch_coords = self._generate_patch_coords(patch_size, stride)
+        
+        # 划分训练/验证集
+        self._split_data(split, split_ratio)
+    
+    def __len__(self):
+        return len(self.patch_coords)
+    
+    def __getitem__(self, idx):
+        i, j = self.patch_coords[idx]
+        
+        # 输入: [重力, 梯度, 经度, 纬度, h_mlp]
+        x = np.stack([
+            self.grav[i:i+self.patch_size, j:j+self.patch_size],
+            self.curv[i:i+self.patch_size, j:j+self.patch_size],
+            self.lon_grid[i:i+self.patch_size, j:j+self.patch_size],
+            self.lat_grid[i:i+self.patch_size, j:j+self.patch_size],
+            self.h_mlp[i:i+self.patch_size, j:j+self.patch_size]
+        ], axis=0)
+        
+        # 输出: 绝对深度
+        y = self.depth[i:i+self.patch_size, j:j+self.patch_size]
+        y = y[None, :, :]  # 增加通道维度
+        
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32)
+        )
+    
+    # 辅助方法
+    def _read_data(self, path, var_name, lon_range, lat_range):
+        """读取单个数据文件"""
+        ds = xr.open_dataset(path)
+        data = ds[var_name].sel(
+            lon=slice(*lon_range),
+            lat=slice(*lat_range)
+        ).values
+        ds.close()
+        return data
+    
+    def _read_and_downsample_gebco(self, path, var_name, lon_range, lat_range, target_shape, method="mean"):
+        """读取GEBCO数据并下采样到目标形状"""
+        ds = xr.open_dataset(path)
+        gebco_highres = ds[var_name].sel(
+            lon=slice(*lon_range),
+            lat=slice(*lat_range)
+        ).values
+        ds.close()
+        
+        H_high, W_high = gebco_highres.shape
+        H_low, W_low = target_shape
+        
+        # 计算下采样因子
+        factor_h = H_high // H_low
+        factor_w = W_high // W_low
+        
+        if factor_h == 0 or factor_w == 0:
+            raise ValueError(f"目标形状{target_shape}比原始形状({H_high}, {W_high})还大，无法下采样")
+        
+        # 检查是否能整除
+        if H_high % factor_h != 0 or W_high % factor_w != 0:
+            print(f"警告: GEBCO形状({H_high}, {W_high})不能整除下采样因子({factor_h}, {factor_w})")
+            print("将使用调整后的因子进行下采样")
+            factor_h = H_high // H_low
+            factor_w = W_high // W_low
+        
+        # 重塑数组以进行下采样
+        gebco_reshaped = gebco_highres.reshape(
+            H_low, factor_h, W_low, factor_w
+        )
+        
+        # 根据方法进行下采样
+        if method == "mean":
+            return gebco_reshaped.mean(axis=(1, 3))
+        elif method == "median":
+            return np.median(gebco_reshaped, axis=(1, 3))
+        elif method == "max":
+            return gebco_reshaped.max(axis=(1, 3))
+        elif method == "min":
+            return gebco_reshaped.min(axis=(1, 3))
+        else:
+            raise ValueError(f"未知的下采样方法: {method}")
+    
+    def _validate_shapes(self):
+        """验证所有数据形状一致"""
+        shapes = {
+            "重力": self.grav.shape,
+            "梯度": self.curv.shape,
+            "水深": self.depth.shape,
+            "MLP预测": self.h_mlp.shape
+        }
+        
+        # 检查所有形状是否相同
+        base_shape = self.grav.shape
+        for name, shape in shapes.items():
+            if shape != base_shape:
+                raise ValueError(f"{name}数据形状{shape}与重力数据形状{base_shape}不匹配")
+        
+        print(f"所有数据形状一致: {base_shape}")
+    
+    def _create_lonlat_grid(self, lon_range, lat_range):
+        """创建经纬度网格"""
+        lon = np.linspace(lon_range[0], lon_range[1], self.W)
+        lat = np.linspace(lat_range[1], lat_range[0], self.H)  # 注意纬度方向
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        
+        # 归一化到[0, 1]
+        lon_min, lon_max = lon_range
+        lat_min, lat_max = lat_range
+        self.lon_grid = (lon_grid - lon_min) / (lon_max - lon_min)
+        self.lat_grid = (lat_grid - lat_min) / (lat_max - lat_min)
+    
+    def _compute_normalize_stats(self, lon_range, lat_range):
+        """计算归一化统计信息"""
+        self.stats = {
+            'grav_mean': self.grav.mean(),
+            'grav_std': self.grav.std() + 1e-6,
+            'curv_mean': self.curv.mean(),
+            'curv_std': self.curv.std() + 1e-6,
+            'h_mlp_mean': self.h_mlp.mean(),
+            'h_mlp_std': self.h_mlp.std() + 1e-6,
+            'depth_mean': self.depth.mean(),
+            'depth_std': self.depth.std() + 1e-6,
+        }
+        
+        # 应用归一化
+        self.grav = (self.grav - self.stats['grav_mean']) / self.stats['grav_std']
+        self.curv = (self.curv - self.stats['curv_mean']) / self.stats['curv_std']
+        self.h_mlp = (self.h_mlp - self.stats['h_mlp_mean']) / self.stats['h_mlp_std']
+        self.depth = (self.depth - self.stats['depth_mean']) / self.stats['depth_std']
+        
+        print("归一化统计信息:")
+        for key, value in self.stats.items():
+            if 'mean' in key:
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value:.6f}")
+    
+    def _load_normalize_stats(self, stats_path, lon_range, lat_range):
+        """加载预计算的统计信息"""
+        stats = np.load(stats_path)
+        self.stats = stats
+        
+        # 应用归一化
+        self.grav = (self.grav - stats['grav_mean']) / stats['grav_std']
+        self.curv = (self.curv - stats['curv_mean']) / stats['curv_std']
+        self.h_mlp = (self.h_mlp - stats['h_mlp_mean']) / stats['h_mlp_std']
+        self.depth = (self.depth - stats['depth_mean']) / stats['depth_std']
+    
+    def _generate_patch_coords(self, patch_size, stride):
+        """生成patch坐标"""
+        coords = []
+        H, W = self.H, self.W
+        
+        # 常规patches
+        for i in range(0, H - patch_size + 1, stride):
+            for j in range(0, W - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        # 边界补丁
+        if (H - patch_size) % stride != 0:
+            i = H - patch_size
+            for j in range(0, W - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        if (W - patch_size) % stride != 0:
+            j = W - patch_size
+            for i in range(0, H - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        # 右下角
+        if (H - patch_size) % stride != 0 and (W - patch_size) % stride != 0:
+            coords.append((H - patch_size, W - patch_size))
+        
+        print(f"生成 {len(coords)} 个patch坐标")
+        return coords
+    
+    def _split_data(self, split, split_ratio):
+        """划分训练/验证集"""
+        if split == "all":
+            return
+        
+        split_idx = int(len(self.patch_coords) * split_ratio)
+        if split == "train":
+            self.patch_coords = self.patch_coords[:split_idx]
+        elif split == "val":
+            self.patch_coords = self.patch_coords[split_idx:]
+        else:
+            raise ValueError(f"Unknown split: {split}")
+        
+        print(f"{split}集样本数: {len(self.patch_coords)}")
+    
+    def save_stats(self, path):
+        """保存归一化统计信息"""
+        if hasattr(self, 'stats'):
+            np.savez(path, **self.stats)
+            print(f"归一化统计信息已保存到: {path}")
+# unet绝对深度网络的推理用数据读取
+class BathymetryInferenceDataset(Dataset):
+    """推理用数据读取类"""
+    
+    def __init__(
+        self,
+        grav_path,
+        curv_path,
+        h_mlp_path,
+        lon_range,
+        lat_range,
+        patch_size=64,
+        stride=32,
+        stats_path=None
+    ):
+        super().__init__()
+        
+        # 读取数据
+        self.grav = self._read_data(grav_path, "z", lon_range, lat_range)
+        self.curv = self._read_data(curv_path, "z", lon_range, lat_range)
+        self.h_mlp = self._read_data(h_mlp_path, "predicted_depth", lon_range, lat_range)
+        
+        # 获取形状和经纬度
+        self.H, self.W = self.grav.shape
+        self.patch_size = patch_size
+        
+        # 创建经纬度网格
+        self._create_lonlat_grid(lon_range, lat_range)
+        
+        # 归一化
+        if stats_path:
+            self._apply_normalization(stats_path, lon_range, lat_range)
+        
+        # 堆叠输入
+        self.inputs = np.stack([
+            self.grav, self.curv, self.lon_grid, self.lat_grid, self.h_mlp
+        ], axis=0)  # [5, H, W]
+        
+        # 生成patch坐标
+        self.patch_coords = self._generate_patch_coords(patch_size, stride)
+        
+        # 获取经纬度数组（用于保存结果）
+        self._get_lonlat_arrays(lon_range, lat_range)
+    
+    def __len__(self):
+        return len(self.patch_coords)
+    
+    def __getitem__(self, idx):
+        i, j = self.patch_coords[idx]
+        patch = self.inputs[:, i:i+self.patch_size, j:j+self.patch_size]
+        return torch.tensor(patch, dtype=torch.float32)
+    
+    # 辅助方法
+    def _read_data(self, path, var_name, lon_range, lat_range):
+        ds = xr.open_dataset(path)
+        data = ds[var_name].sel(
+            lon=slice(*lon_range),
+            lat=slice(*lat_range)
+        ).values
+        ds.close()
+        return data
+    
+    def _create_lonlat_grid(self, lon_range, lat_range):
+        """创建归一化的经纬度网格"""
+        lon = np.linspace(lon_range[0], lon_range[1], self.W)
+        lat = np.linspace(lat_range[1], lat_range[0], self.H)  # 注意纬度方向
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        
+        lon_min, lon_max = lon_range
+        lat_min, lat_max = lat_range
+        self.lon_grid = (lon_grid - lon_min) / (lon_max - lon_min)
+        self.lat_grid = (lat_grid - lat_min) / (lat_max - lat_min)
+    
+    def _get_lonlat_arrays(self, lon_range, lat_range):
+        """获取一维经纬度数组（用于保存结果）"""
+        self.lons = np.linspace(lon_range[0], lon_range[1], self.W)
+        self.lats = np.linspace(lat_range[1], lat_range[0], self.H)  # 注意纬度方向
+    
+    def _apply_normalization(self, stats_path, lon_range, lat_range):
+        stats = np.load(stats_path)
+        self.grav = (self.grav - stats['grav_mean']) / stats['grav_std']
+        self.curv = (self.curv - stats['curv_mean']) / stats['curv_std']
+        self.h_mlp = (self.h_mlp - stats['h_mlp_mean']) / stats['h_mlp_std']
+    
+    def _generate_patch_coords(self, patch_size, stride):
+        coords = []
+        H, W = self.H, self.W
+        
+        for i in range(0, H - patch_size + 1, stride):
+            for j in range(0, W - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        if (H - patch_size) % stride != 0:
+            i = H - patch_size
+            for j in range(0, W - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        if (W - patch_size) % stride != 0:
+            j = W - patch_size
+            for i in range(0, H - patch_size + 1, stride):
+                coords.append((i, j))
+        
+        if (H - patch_size) % stride != 0 and (W - patch_size) % stride != 0:
+            coords.append((H - patch_size, W - patch_size))
+        
+        print(f"推理数据集生成 {len(coords)} 个patch坐标")
+        return coords
