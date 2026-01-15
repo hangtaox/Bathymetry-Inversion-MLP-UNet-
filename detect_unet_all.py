@@ -19,9 +19,12 @@ PATHS = {
     "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
     "gebco_path": Path("./data/GEBCO_2024/gebco_2024/GEBCO_2024.nc"),
     "curv_path": Path("./data/SWOT/curv_SWOT_02.nc"),
-    "h_mlp_path": Path("./tmp_img/mlp_prediction.nc")
+    "b_lp_path": Path("./data/processed/B_LP.nc"),
+    "g_lp_path": Path("./data/processed/G_LP.nc"),
+    "g_bp_path": Path("./data/processed/G_BP.nc"),
+    "vgg_bp_path": Path("./data/processed/VGG_BP.nc")
 }
-LON_RANGE = (112, 114)
+LON_RANGE = (114, 116)
 LAT_RANGE = (15, 18)
 
 def make_gaussian_weight(patch_size, sigma_ratio=0.25):
@@ -237,7 +240,10 @@ def main():
     dataset = BathymetryInferenceDataset(
         grav_path=PATHS["grav_path"],
         curv_path=PATHS["curv_path"],
-        h_mlp_path=PATHS["h_mlp_path"],
+        b_lp_path=PATHS["b_lp_path"],
+        g_lp_path=PATHS["g_lp_path"],
+        g_bp_path=PATHS["g_bp_path"],
+        vgg_bp_path=PATHS["vgg_bp_path"],
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
         patch_size=64,
@@ -250,7 +256,7 @@ def main():
     
     # 加载模型
     print("加载UNet模型...")
-    model = BathymetryUNet(in_channels=5, out_channels=1, base_ch=32)
+    model = BathymetryUNet(in_channels=8, out_channels=1, base_ch=32)
     model.load_state_dict(
         torch.load("./checkpoints/unet/bathymetry_unet_best.pt", 
                   map_location=device)

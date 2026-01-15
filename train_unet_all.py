@@ -28,10 +28,13 @@ PATHS = {
     "grav_path": Path("./data/SWOT/grav_SWOT_02.nc"),
     "gebco_path": Path("./data/GEBCO_2024/gebco_2024/GEBCO_2024.nc"),
     "curv_path": Path("./data/SWOT/curv_SWOT_02.nc"),
-    "h_mlp_path": Path("./tmp_img/mlp_prediction.nc")
+    "b_lp_path": Path("./data/processed/B_LP.nc"),
+    "g_lp_path": Path("./data/processed/G_LP.nc"),
+    "g_bp_path": Path("./data/processed/G_BP.nc"),
+    "vgg_bp_path": Path("./data/processed/VGG_BP.nc")
 }
-LON_RANGE = (112, 114)
-LAT_RANGE = (15, 18) 
+LON_RANGE = (114, 116)
+LAT_RANGE = (15, 18)
 
 def compute_physical_metrics(h_pred, h_true):
     """计算物理指标"""
@@ -53,7 +56,10 @@ def train():
         grav_path=PATHS["grav_path"],
         curv_path=PATHS["curv_path"],
         gebco_path=PATHS["gebco_path"],
-        h_mlp_path=PATHS["h_mlp_path"],
+        b_lp_path=PATHS["b_lp_path"],
+        g_lp_path=PATHS["g_lp_path"],
+        g_bp_path=PATHS["g_bp_path"],
+        vgg_bp_path=PATHS["vgg_bp_path"],
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
         patch_size=64,
@@ -67,7 +73,10 @@ def train():
         grav_path=PATHS["grav_path"],
         curv_path=PATHS["curv_path"],
         gebco_path=PATHS["gebco_path"],
-        h_mlp_path=PATHS["h_mlp_path"],
+        b_lp_path=PATHS["b_lp_path"],
+        g_lp_path=PATHS["g_lp_path"],
+        g_bp_path=PATHS["g_bp_path"],
+        vgg_bp_path=PATHS["vgg_bp_path"],
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
         patch_size=64,
@@ -99,7 +108,7 @@ def train():
     
     # 创建模型
     model = BathymetryUNet(
-        in_channels=5,  # 重力、梯度、经度、纬度、h_mlp
+        in_channels=8,  # 重力、梯度、经度、纬度、测深数据长波分量（B_LP）、重力异常低通(G_LP)、重力异常带通(G_BP)、重力梯度带通(VGG_BP)
         out_channels=1,  # 预测绝对深度
         base_ch=32
     ).to(device)
