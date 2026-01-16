@@ -458,7 +458,7 @@ class BathymetryInferencePatchDataset(Dataset):
 class BathymetryDataset(Dataset):
     """
     UNet用Patch Dataset
-    输入: [5, H, W] (重力, 梯度, lon, lat, h_mlp)
+    输入: [8, H, W] (重力, 梯度, lon, lat, B_LP, G_LP, G_BP, VGG_BP)
     输出: [1, H, W] (水深绝对深度)
     """
 
@@ -467,7 +467,10 @@ class BathymetryDataset(Dataset):
         grav_path,
         curv_path,
         gebco_path,
-        h_mlp_path,
+        b_lp_path,
+        g_lp_path,
+        g_bp_path,
+        vgg_bp_path,        
         lon_range=(110, 114),
         lat_range=(15, 18),
         patch_size=64,
@@ -486,8 +489,20 @@ class BathymetryDataset(Dataset):
         
         # 读取其他数据
         self.curv = self._read_data(curv_path, "z", lon_range, lat_range)
-        self.h_mlp = self._read_data(h_mlp_path, "predicted_depth", lon_range, lat_range)
-        
+        self.g_lp = self._read_data(g_lp_path, "G_LP", lon_range, lat_range)
+        self.g_bp = self._read_data(g_bp_path, "G_BP", lon_range, lat_range)
+        self.vgg_bp = self._read_data(vgg_bp_path, "VGG_BP", lon_range, lat_range)
+
+
+        # self.h_mlp = self._read_data(h_mlp_path, "prection_depth", lon_range, lat_range)
+        self.b_lp = self._read_and_downsample_gebco(
+            b_lp_path, 
+            "B_LP", 
+            lon_range, 
+            lat_range, 
+            target_shape=(self.H, self.W),
+            method=downsample_method
+        )        
         # 读取GEBCO数据并下采样到与重力数据相同的分辨率
         self.depth = self._read_and_downsample_gebco(
             gebco_path, 
@@ -530,7 +545,10 @@ class BathymetryDataset(Dataset):
             self.curv[i:i+self.patch_size, j:j+self.patch_size],
             self.lon_grid[i:i+self.patch_size, j:j+self.patch_size],
             self.lat_grid[i:i+self.patch_size, j:j+self.patch_size],
-            self.h_mlp[i:i+self.patch_size, j:j+self.patch_size]
+            self.b_lp[i:i+self.patch_size, j:j+self.patch_size],
+            self.g_lp[i:i+self.patch_size, j:j+self.patch_size],
+            self.g_bp[i:i+self.patch_size, j:j+self.patch_size],
+            self.vgg_bp[i:i+self.patch_size, j:j+self.patch_size]
         ], axis=0)
         
         # 输出: 绝对深度
@@ -602,10 +620,12 @@ class BathymetryDataset(Dataset):
             "重力": self.grav.shape,
             "梯度": self.curv.shape,
             "水深": self.depth.shape,
-            "MLP预测": self.h_mlp.shape
+            "B_LP": self.b_lp.shape,
+            "G_LP": self.g_lp.shape,
+            "G_BP": self.g_bp.shape,
+            "VGG_BP": self.vgg_bp.shape
         }
         
-        # 检查所有形状是否相同
         base_shape = self.grav.shape
         for name, shape in shapes.items():
             if shape != base_shape:
@@ -632,16 +652,25 @@ class BathymetryDataset(Dataset):
             'grav_std': self.grav.std() + 1e-6,
             'curv_mean': self.curv.mean(),
             'curv_std': self.curv.std() + 1e-6,
-            'h_mlp_mean': self.h_mlp.mean(),
-            'h_mlp_std': self.h_mlp.std() + 1e-6,
+            'b_lp_mean': self.b_lp.mean(),
+            'b_lp_std': self.b_lp.std() + 1e-6,
+            'g_lp_mean': self.g_lp.mean(),
+            'g_lp_std': self.g_lp.std() + 1e-6,
+            'g_bp_mean': self.g_bp.mean(),
+            'g_bp_std': self.g_bp.std() + 1e-6,
+            'vgg_bp_mean': self.vgg_bp.mean(),
+            'vgg_bp_std': self.vgg_bp.std() + 1e-6,
             'depth_mean': self.depth.mean(),
             'depth_std': self.depth.std() + 1e-6,
         }
         
-        # 应用归一化
+        # 应用归一化到所有通道
         self.grav = (self.grav - self.stats['grav_mean']) / self.stats['grav_std']
         self.curv = (self.curv - self.stats['curv_mean']) / self.stats['curv_std']
-        self.h_mlp = (self.h_mlp - self.stats['h_mlp_mean']) / self.stats['h_mlp_std']
+        self.b_lp = (self.b_lp - self.stats['b_lp_mean']) / self.stats['b_lp_std']
+        self.g_lp = (self.g_lp - self.stats['g_lp_mean']) / self.stats['g_lp_std']
+        self.g_bp = (self.g_bp - self.stats['g_bp_mean']) / self.stats['g_bp_std']
+        self.vgg_bp = (self.vgg_bp - self.stats['vgg_bp_mean']) / self.stats['vgg_bp_std']
         self.depth = (self.depth - self.stats['depth_mean']) / self.stats['depth_std']
         
         print("归一化统计信息:")
@@ -656,10 +685,13 @@ class BathymetryDataset(Dataset):
         stats = np.load(stats_path)
         self.stats = stats
         
-        # 应用归一化
+        # 应用归一化到所有通道
         self.grav = (self.grav - stats['grav_mean']) / stats['grav_std']
         self.curv = (self.curv - stats['curv_mean']) / stats['curv_std']
-        self.h_mlp = (self.h_mlp - stats['h_mlp_mean']) / stats['h_mlp_std']
+        self.b_lp = (self.b_lp - stats['b_lp_mean']) / stats['b_lp_std']
+        self.g_lp = (self.g_lp - stats['g_lp_mean']) / stats['g_lp_std']
+        self.g_bp = (self.g_bp - stats['g_bp_mean']) / stats['g_bp_std']
+        self.vgg_bp = (self.vgg_bp - stats['vgg_bp_mean']) / stats['vgg_bp_std']
         self.depth = (self.depth - stats['depth_mean']) / stats['depth_std']
     
     def _generate_patch_coords(self, patch_size, stride):
@@ -710,6 +742,7 @@ class BathymetryDataset(Dataset):
         if hasattr(self, 'stats'):
             np.savez(path, **self.stats)
             print(f"归一化统计信息已保存到: {path}")
+
 # unet绝对深度网络的推理用数据读取
 class BathymetryInferenceDataset(Dataset):
     """推理用数据读取类"""
@@ -718,7 +751,10 @@ class BathymetryInferenceDataset(Dataset):
         self,
         grav_path,
         curv_path,
-        h_mlp_path,
+        b_lp_path,     # 新增
+        g_lp_path,     # 新增
+        g_bp_path,     # 新增
+        vgg_bp_path,   # 新增
         lon_range,
         lat_range,
         patch_size=64,
@@ -730,11 +766,26 @@ class BathymetryInferenceDataset(Dataset):
         # 读取数据
         self.grav = self._read_data(grav_path, "z", lon_range, lat_range)
         self.curv = self._read_data(curv_path, "z", lon_range, lat_range)
-        self.h_mlp = self._read_data(h_mlp_path, "predicted_depth", lon_range, lat_range)
+        
+
+        self.g_lp = self._read_data(g_lp_path, "G_LP", lon_range, lat_range)
+        self.g_bp = self._read_data(g_bp_path, "G_BP", lon_range, lat_range)
+        self.vgg_bp = self._read_data(vgg_bp_path, "VGG_BP", lon_range, lat_range)
+
         
         # 获取形状和经纬度
         self.H, self.W = self.grav.shape
         self.patch_size = patch_size
+        
+        self.b_lp = self._read_and_downsample_gebco(
+            b_lp_path, 
+            "B_LP", 
+            lon_range, 
+            lat_range, 
+            target_shape=(self.H, self.W),
+            method='median'
+        )
+
         
         # 创建经纬度网格
         self._create_lonlat_grid(lon_range, lat_range)
@@ -745,14 +796,64 @@ class BathymetryInferenceDataset(Dataset):
         
         # 堆叠输入
         self.inputs = np.stack([
-            self.grav, self.curv, self.lon_grid, self.lat_grid, self.h_mlp
-        ], axis=0)  # [5, H, W]
+            self.grav, 
+            self.curv, 
+            self.lon_grid, 
+            self.lat_grid, 
+            self.b_lp,    # 新增
+            self.g_lp,    # 新增
+            self.g_bp,    # 新增
+            self.vgg_bp   # 新增
+        ], axis=0)  # [8, H, W]
         
         # 生成patch坐标
         self.patch_coords = self._generate_patch_coords(patch_size, stride)
         
         # 获取经纬度数组（用于保存结果）
         self._get_lonlat_arrays(lon_range, lat_range)
+    
+    def _read_and_downsample_gebco(self, path, var_name, lon_range, lat_range, target_shape, method="mean"):
+        """读取GEBCO数据并下采样到目标形状"""
+        ds = xr.open_dataset(path)
+        gebco_highres = ds[var_name].sel(
+            lon=slice(*lon_range),
+            lat=slice(*lat_range)
+        ).values
+        ds.close()
+        
+        H_high, W_high = gebco_highres.shape
+        H_low, W_low = target_shape
+        
+        # 计算下采样因子
+        factor_h = H_high // H_low
+        factor_w = W_high // W_low
+        
+        if factor_h == 0 or factor_w == 0:
+            raise ValueError(f"目标形状{target_shape}比原始形状({H_high}, {W_high})还大，无法下采样")
+        
+        # 检查是否能整除
+        if H_high % factor_h != 0 or W_high % factor_w != 0:
+            print(f"警告: GEBCO形状({H_high}, {W_high})不能整除下采样因子({factor_h}, {factor_w})")
+            print("将使用调整后的因子进行下采样")
+            factor_h = H_high // H_low
+            factor_w = W_high // W_low
+        
+        # 重塑数组以进行下采样
+        gebco_reshaped = gebco_highres.reshape(
+            H_low, factor_h, W_low, factor_w
+        )
+        
+        # 根据方法进行下采样
+        if method == "mean":
+            return gebco_reshaped.mean(axis=(1, 3))
+        elif method == "median":
+            return np.median(gebco_reshaped, axis=(1, 3))
+        elif method == "max":
+            return gebco_reshaped.max(axis=(1, 3))
+        elif method == "min":
+            return gebco_reshaped.min(axis=(1, 3))
+        else:
+            raise ValueError(f"未知的下采样方法: {method}")
     
     def __len__(self):
         return len(self.patch_coords)
@@ -792,7 +893,10 @@ class BathymetryInferenceDataset(Dataset):
         stats = np.load(stats_path)
         self.grav = (self.grav - stats['grav_mean']) / stats['grav_std']
         self.curv = (self.curv - stats['curv_mean']) / stats['curv_std']
-        self.h_mlp = (self.h_mlp - stats['h_mlp_mean']) / stats['h_mlp_std']
+        self.b_lp = (self.b_lp - stats['b_lp_mean']) / stats['b_lp_std']
+        self.g_lp = (self.g_lp - stats['g_lp_mean']) / stats['g_lp_std']
+        self.g_bp = (self.g_bp - stats['g_bp_mean']) / stats['g_bp_std']
+        self.vgg_bp = (self.vgg_bp - stats['vgg_bp_mean']) / stats['vgg_bp_std']
     
     def _generate_patch_coords(self, patch_size, stride):
         coords = []
