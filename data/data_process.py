@@ -12,8 +12,8 @@ PATHS = {
     "curv_path": r"D:\project\data\SWOT\curv_SWOT_02.nc"
 }
 
-LON_RANGE = (114, 116)
-LAT_RANGE = (15, 18)
+LON_RANGE = (105, 125)
+LAT_RANGE = (0, 30)
 
 OUT_DIR = Path(r"D:\project\data\processed")
 OUT_DIR.mkdir(exist_ok=True)
@@ -56,7 +56,6 @@ def lowpass_filter(data, dx_km, dy_km, cutoff_wavelength_km):
     F = np.fft.fft2(data)
     return np.real(np.fft.ifft2(F * W1))
 
-
 def bandpass_filter(data, dx_km, dy_km, cutoff_wavelength_km, depth_km, A):
     nx, ny = data.shape
     k = radial_wavenumber(nx, ny, dx_km, dy_km)
@@ -67,6 +66,13 @@ def bandpass_filter(data, dx_km, dy_km, cutoff_wavelength_km, depth_km, A):
 
     F = np.fft.fft2(data)
     return np.real(np.fft.ifft2(F * HP * W2 * DC))
+
+def fill_nan_with_mean(data):
+    mean_val = np.nanmean(data)
+    filled = data.copy()
+    filled[np.isnan(filled)] = mean_val
+    return filled
+
 
 def load_and_crop(path, var_name):
     ds = xr.open_dataset(path)
@@ -132,36 +138,73 @@ grav = load_and_crop(PATHS["grav_path"], var_name="z")
 
 # VGG / curvature
 curv = load_and_crop(PATHS["curv_path"], var_name="z")
-# gebco分辨率不一样
-bathy_lon = bathy.lon.values
-bathy_lat = bathy.lat.values
 
-bathy_dx_km, bathy_dy_km = grid_spacing_km(bathy_lon, bathy_lat)
 # swot数据
 lon = grav.lon.values
 lat = grav.lat.values
 
 dx_km, dy_km = grid_spacing_km(lon, lat)
 
-B = bathy.values
-G = grav.values
-VGG = curv.values
+# ======================
+# 1. GEBCO 海洋掩膜
+# ======================
+# 海洋：elevation < 0
+bathy_ocean_mask = bathy.values < 0    # True = 海洋，False = 陆地
+# ======================
+# 2. 掩膜插值到 SWOT 网格
+# ======================
+mask_da = xr.DataArray(
+    bathy_ocean_mask.astype(np.int8),
+    coords={"lat": bathy.lat, "lon": bathy.lon},
+    dims=("lat", "lon")
+)
+
+# 插值到 grav / curv 网格
+mask_on_swot = mask_da.interp(
+    lon=grav.lon,
+    lat=grav.lat,
+    method="nearest"   # 掩膜一定要 nearest
+)
+
+ocean_mask = mask_on_swot.values.astype(bool)
+
+B = bathy.interp(
+    lon=grav.lon,
+    lat=grav.lat,
+    method="linear"
+).values
+B[~ocean_mask] = np.nan
+G = grav.values.copy()
+VGG = curv.values.copy()
+
+B_filled = fill_nan_with_mean(B)
+G_filled = fill_nan_with_mean(G)
+VGG_filled = fill_nan_with_mean(VGG)
 
 # ======================
 # Filtering
 # ======================
-B_LP = lowpass_filter(B, bathy_dx_km, bathy_dy_km, CUTOFF_WAVELENGTH_KM)
+B_LP = lowpass_filter(B_filled, dx_km, dy_km, CUTOFF_WAVELENGTH_KM)
+G_LP = lowpass_filter(G_filled, dx_km, dy_km, CUTOFF_WAVELENGTH_KM)
 
-G_LP = lowpass_filter(G, dx_km, dy_km, CUTOFF_WAVELENGTH_KM)
+G_BP = bandpass_filter(
+    G_filled, dx_km, dy_km,
+    CUTOFF_WAVELENGTH_KM, DEPTH_KM, A_W2
+)
 
-G_BP = bandpass_filter(G, dx_km, dy_km,
-                       CUTOFF_WAVELENGTH_KM, DEPTH_KM, A_W2)
+VGG_BP = bandpass_filter(
+    VGG_filled, dx_km, dy_km,
+    CUTOFF_WAVELENGTH_KM, DEPTH_KM, A_W2
+)
+# ======================
+# 滤波后重新施加掩膜（防止频域泄漏）
+# ======================
+B_LP[~ocean_mask] = np.nan
+G_LP[~ocean_mask] = np.nan
+G_BP[~ocean_mask] = np.nan
+VGG_BP[~ocean_mask] = np.nan
 
-VGG_BP = bandpass_filter(VGG, dx_km, dy_km,
-                         CUTOFF_WAVELENGTH_KM, DEPTH_KM, A_W2)
-
-
-save_nc(B_LP, "B_LP", "m",bathy_lon, bathy_lat)
+save_nc(B_LP, "B_LP", "m",lon, lat)
 save_nc(G_LP, "G_LP", "mGal",lon, lat)
 save_nc(G_BP, "G_BP", "mGal",lon, lat)
 save_nc(VGG_BP, "VGG_BP", "s^-2",lon, lat)
