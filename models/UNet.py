@@ -46,10 +46,10 @@ class Up(nn.Module):
     """
     Upsampling + Skip connection
     """
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_ch, out_ch)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = DoubleConv(in_ch + skip_ch, out_ch)
 
     def forward(self, x, skip):
         x = self.up(x)
@@ -77,10 +77,10 @@ class BathymetryUNet(nn.Module):
         self.down1 = Down(base_ch, base_ch * 2)
         self.down2 = Down(base_ch * 2, base_ch * 4)
         self.down3 = Down(base_ch * 4, base_ch * 8)
-
-        self.up1 = Up(base_ch * 8, base_ch * 4)
-        self.up2 = Up(base_ch * 4, base_ch * 2)
-        self.up3 = Up(base_ch * 2, base_ch)
+        
+        self.up1 = Up(base_ch * 8, base_ch * 4, base_ch * 4)
+        self.up2 = Up(base_ch * 4, base_ch * 2, base_ch * 2)
+        self.up3 = Up(base_ch * 2, base_ch,     base_ch)
 
         self.out_conv = nn.Conv2d(base_ch, out_channels, kernel_size=1)
 
