@@ -104,7 +104,7 @@ def train():
         aligned_ship_nc_path=ALIGNED_SHIP_NC,
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
-        patch_size=5,          # ★ 局部感受野，与双流网络默认的 5x5 一致
+        patch_size=11,          # ★ 局部感受野，与双流网络默认的 5x5 一致
         normalize=True,
     )
 
@@ -154,7 +154,7 @@ def train():
     # 注意这里传入 in_channels 以及对应的 patch_size
     model = DualStreamFusionNet(
         in_channels=dataset.X.shape[1], 
-        patch_size=5
+        patch_size=11
     ).to(device)
     
     criterion = nn.MSELoss()
@@ -339,7 +339,7 @@ def train():
     plt.xlabel("Ship depth (m)")
     plt.ylabel("Predicted depth (m)")
     # 【修改】在 title 中加入了 STD={std:.2f} m
-    plt.title(f"Dual-Stream Pred vs GT\nRMSE={rmse:.2f} m, STD={std:.2f} m, R={r:.3f}")
+    plt.title(f"Dual-Stream Pred vs GT\nMAE={mae:.2f} m, RMSE={rmse:.2f} m, STD={std:.2f} m, R={r:.3f}")
     plt.grid(alpha=0.3)
     plt.tight_layout()
     # 【修改7】所有图片名字修改
