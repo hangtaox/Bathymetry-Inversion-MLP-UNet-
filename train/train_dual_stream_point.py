@@ -3,29 +3,33 @@ import time
 import json
 from pathlib import Path
 
+import pandas as pd
 import numpy as np
-import xarray as xr
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from scipy import ndimage
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.stats import pearsonr
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from models.cnn import CNNEncoderFC
+from models.dual_stream import DualStreamFusionNet 
 from data.dataset_cnn import BathymetryShipPointCNNDataset
 
-# ============================================================
-#  训练主程序
-# ============================================================
+# =========================================================
+# 【核心修改】在这里统一控制感受野大小，后续所有路径和参数会自动跟随
+# =========================================================
+PATCH_SIZE = 13  
 
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] Using device: {device}")
 
-    os.makedirs("./checkpoints/cnn", exist_ok=True)
-    os.makedirs("./tmp_img", exist_ok=True)
+    # 【修复报错】动态创建包含 patch_size 的专属文件夹，确保画图时路径存在
+    CKPT_DIR = f"./checkpoints/dual_stream/{PATCH_SIZE}"
+    RESULT_DIR = f"./result/dual_stream/{PATCH_SIZE}"
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(RESULT_DIR, exist_ok=True)
 
     # =========================
     # 数据路径 & 研究区
@@ -37,13 +41,18 @@ def train():
         "g_lp": "./data/processed/G_LP.nc",
         "g_bp": "./data/processed/G_BP.nc",
         "vgg_bp": "./data/processed/VGG_BP.nc",
+        "g_east": "./data/processed/G_East.nc",
+        "g_north": "./data/processed/G_North.nc",
+        "g_east_bp": "./data/processed/G_East_BP.nc",
+        "g_north_bp": "./data/processed/G_North_BP.nc",
     }
 
-    SHIP_NC = "./ship_bathymetry_points.nc"
-    ALIGNED_SHIP_NC = "./ship_bathymetry_points_aligned.nc"
+    SHIP_NC = "./data/ship_combined_calibrated.nc"
+    ALIGNED_SHIP_NC = "./data/ship_bathymetry_points_aligned.nc"
 
-    LON_RANGE = (105, 125)
-    LAT_RANGE = (0, 30)
+    LON_RANGE = (104, 122)
+    LAT_RANGE = (0, 26)
+
 
     # =========================
     # 构建 Dataset
@@ -54,7 +63,7 @@ def train():
         aligned_ship_nc_path=ALIGNED_SHIP_NC,
         lon_range=LON_RANGE,
         lat_range=LAT_RANGE,
-        patch_size=5,          # ★ 局部感受野
+        patch_size=PATCH_SIZE,  # 动态传入       
         normalize=True,
     )
 
@@ -70,11 +79,10 @@ def train():
         "x_stds": dataset.X_std.squeeze().tolist(),
     }
 
-    with open("./checkpoints/cnn/normalization_params.json", "w") as f:
+    with open(f"{CKPT_DIR}/normalization_params.json", "w") as f:
         json.dump(norm_params, f, indent=4)
 
-    print("[INFO] Normalization parameters saved")
-    print(f"       y_mean={norm_params['y_mean']:.2f}, y_std={norm_params['y_std']:.2f}")
+    print(f"[INFO] Normalization parameters saved to {CKPT_DIR}")
 
     # =========================
     # 数据集划分 8:1:1
@@ -99,58 +107,63 @@ def train():
     # =========================
     # 模型 & 优化器
     # =========================
-    model = CNNEncoderFC(in_channels=6).to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    model = DualStreamFusionNet(
+        in_channels=dataset.X.shape[1], 
+        patch_size=PATCH_SIZE  # 动态传入
+    ).to(device)
+    
+    num_epochs = 100
+
+    criterion = nn.SmoothL1Loss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-5
     )
 
-    # =========================
-    # 训练参数
-    # =========================
-    num_epochs = 120
+    
     patience = 15
-
     best_val = np.inf
+    min_delta = 5e-6
     best_epoch = -1
     no_improve = 0
-
     train_hist, val_hist = [], []
 
     # =========================
     # 训练循环
     # =========================
-    print("\n[INFO] Start training...\n")
+    print("\n[INFO] Start training Dual-Stream Network...\n")
 
     for epoch in range(num_epochs):
         t0 = time.time()
-
-        # ---------- Train ----------
         model.train()
         train_loss = 0.0
 
-        for X, y in train_loader:
+        for X, y in tqdm(train_loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False):
             X = X.to(device)
             y = y.to(device).squeeze(1)
 
             optimizer.zero_grad()
+            
+            # 1. 现在模型只返回一个最终深度的预测值
             pred = model(X)
-            loss = criterion(pred, y)
+            
+            loss = criterion(pred, y) 
             loss.backward()
+            
+            # 3. 必须保留梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item() * len(y)
 
         train_loss /= len(train_loader.dataset)
 
-        # ---------- Validation ----------
         model.eval()
         val_loss = 0.0
         y_true_list, y_pred_list = [], []
 
         with torch.no_grad():
-            for X, y in val_loader:
+            for X, y in tqdm(val_loader, desc=f"Epoch {epoch+1:03d} [Val]", leave=False):
                 X = X.to(device)
                 y = y.to(device).squeeze(1)
 
@@ -161,15 +174,16 @@ def train():
                 y_pred_list.append(pred.cpu().numpy())
 
         val_loss /= len(val_loader.dataset)
-        scheduler.step(val_loss)
+        scheduler.step()
 
-        # ---------- 反归一化指标 ----------
+        # 指标计算
         y_true = dataset.inverse_transform_y(np.concatenate(y_true_list))
         y_pred = dataset.inverse_transform_y(np.concatenate(y_pred_list))
-
+        
         val_mae = mean_absolute_error(y_true, y_pred)
         val_rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-        val_corr = pearsonr(y_true, y_pred)[0]
+        val_std = np.std(y_pred - y_true)          
+        val_corr = pearsonr(y_true, y_pred)[0]     
 
         lr = optimizer.param_groups[0]["lr"]
         epoch_time = time.time() - t0
@@ -184,126 +198,81 @@ def train():
             f"Val {val_loss:.5f} | "
             f"MAE {val_mae:.1f} m | "
             f"RMSE {val_rmse:.1f} m | "
+            f"STD {val_std:.1f} m | "
             f"Corr {val_corr:.3f} | "
             f"LR {lr:.1e}"
         )
 
-        # ---------- 保存模型 ----------
-        if val_loss < best_val:
+        if val_loss < (best_val - min_delta):
             best_val = val_loss
             best_epoch = epoch
             no_improve = 0
-            torch.save(model.state_dict(), "./checkpoints/cnn/best_model.pt")
+            torch.save(model.state_dict(), f"{CKPT_DIR}/best_model.pt")
             print("  ↳ Best model updated")
         else:
             no_improve += 1
 
         if (epoch + 1) % 10 == 0:
-            torch.save(model.state_dict(), f"./checkpoints/cnn/epoch_{epoch+1:03d}.pt")
+            torch.save(model.state_dict(), f"{CKPT_DIR}/epoch_{epoch+1:03d}.pt")
+            print(f"  ↳ Periodic save at epoch {epoch+1}")
 
         if no_improve >= patience:
             print(f"\n[Early Stop] Stop at epoch {epoch+1}")
             break
 
     # =========================
-    # 测试集评估 & 可视化
+    # 数据提取与保存
     # =========================
-    print("\n[INFO] Evaluating on test set...")
-
-    model.load_state_dict(torch.load("./checkpoints/cnn/best_model.pt"))
+    print("\n[INFO] Extracting Test Set predictions for analysis...")
+    
+    # 加入 weights_only=True 消除 PyTorch 安全警告
+    model.load_state_dict(torch.load(f"{CKPT_DIR}/best_model.pt", weights_only=True))
     model.eval()
 
     y_true_list, y_pred_list = [], []
+    lon_norm_list, lat_norm_list = [], [] 
+    
+    # 动态计算中心点索引
+    center_idx = PATCH_SIZE // 2 
 
     with torch.no_grad():
         for X, y in test_loader:
             X = X.to(device)
             y = y.to(device)
-
             pred = model(X)
+            
             y_true_list.append(y.cpu().numpy())
             y_pred_list.append(pred.cpu().numpy())
+            lon_norm_list.append(X[:, -2, center_idx, center_idx].cpu().numpy())
+            lat_norm_list.append(X[:, -1, center_idx, center_idx].cpu().numpy())
 
+    # 反归一化
     y_true_norm = np.concatenate(y_true_list).squeeze()
     y_pred_norm = np.concatenate(y_pred_list).squeeze()
+    y_true_real = dataset.inverse_transform_y(y_true_norm)
+    y_pred_real = dataset.inverse_transform_y(y_pred_norm)
+    
+    lon_norm = np.concatenate(lon_norm_list).squeeze()
+    lat_norm = np.concatenate(lat_norm_list).squeeze()
+    lon_mean, lon_std = norm_params["x_means"][-2], norm_params["x_stds"][-2]
+    lat_mean, lat_std = norm_params["x_means"][-1], norm_params["x_stds"][-1]
+    
+    lon_real = lon_norm * lon_std + lon_mean
+    lat_real = lat_norm * lat_std + lat_mean
 
-    y_true = dataset.inverse_transform_y(y_true_norm)
-    y_pred = dataset.inverse_transform_y(y_pred_norm)
-
-    mae  = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    bias = np.mean(y_pred - y_true)
-    r2   = r2_score(y_true, y_pred)
-    r, _ = pearsonr(y_true, y_pred)
-
-    print("\n===== Test Metrics =====")
-    print(f"MAE   : {mae:.3f} m")
-    print(f"RMSE  : {rmse:.3f} m")
-    print(f"Bias  : {bias:.3f} m")
-    print(f"R²    : {r2:.4f}")
-    print(f"CorrR : {r:.4f}")
-
-    # =========================
-    # 散点图
-    # =========================
-    plt.figure(figsize=(6, 6))
-    plt.scatter(y_true, y_pred, s=3, alpha=0.4)
-
-    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
-    plt.plot(lims, lims, "r--", lw=1)
-
-    plt.xlabel("Ship depth (m)")
-    plt.ylabel("Predicted depth (m)")
-    plt.title(f"Prediction vs GT\nRMSE={rmse:.2f} m, R={r:.3f}")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("./tmp_img/cnn_scatter_pred_vs_gt.png", dpi=300)
-    plt.show()
+    test_df = pd.DataFrame({
+        "lon": lon_real,
+        "lat": lat_real,
+        "y_true": y_true_real,
+        "y_pred": y_pred_real
+    })
+    
+    test_csv_path = f"{CKPT_DIR}/test_results.csv"
+    test_df.to_csv(test_csv_path, index=False)
+    print(f"[INFO] Test set predictions saved to {test_csv_path}")
 
     # =========================
-    # 残差分布
-    # =========================
-    residual = y_pred - y_true
-
-    plt.figure(figsize=(6, 4))
-    plt.hist(residual, bins=100, density=True, alpha=0.7)
-    plt.axvline(0, color="r", linestyle="--", label="Zero")
-    plt.xlabel("Residual (Pred - GT) [m]")
-    plt.ylabel("Density")
-    plt.title(f"Residual Distribution\nBias={bias:.2f} m")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("./tmp_img/cnn_residual_hist.png", dpi=300)
-    plt.show()
-
-    # =========================
-    # RMSE vs Depth
-    # =========================
-    bins = np.arange(y_true.min(), y_true.max(), 200)
-    rmse_bins = []
-
-    for i in range(len(bins) - 1):
-        mask = (y_true >= bins[i]) & (y_true < bins[i + 1])
-        if mask.sum() < 50:
-            rmse_bins.append(np.nan)
-        else:
-            rmse_bins.append(
-                np.sqrt(mean_squared_error(y_true[mask], y_pred[mask]))
-            )
-
-    plt.figure(figsize=(7, 4))
-    plt.plot(bins[:-1], rmse_bins, marker="o")
-    plt.xlabel("Depth bin (m)")
-    plt.ylabel("RMSE (m)")
-    plt.title("RMSE vs Depth")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("./tmp_img/cnn_rmse_vs_depth.png", dpi=300)
-    plt.show()
-
-    # =========================
-    # 训练曲线
+    # 训练历史曲线 
     # =========================
     plt.figure(figsize=(8, 5))
     plt.plot(train_hist, label="Train")
@@ -312,14 +281,13 @@ def train():
     plt.legend()
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("Training History")
+    plt.title(f"Dual-Stream Training History (Patch: {PATCH_SIZE})")
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig("./tmp_img/cnn_train_val_curve.png", dpi=300)
-    plt.show()
-
-    print("\n[INFO] Done.")
-
+    plt.savefig(f"{RESULT_DIR}/dual_train_val_curve.png", dpi=300)
+    plt.close()
+    
+    print("\n[INFO] Training complete! Run evaluate_models.py to generate analysis plots and full map.")
 
 if __name__ == "__main__":
     train()

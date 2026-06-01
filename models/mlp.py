@@ -12,6 +12,7 @@ class ResidualMLP(nn.Module):
     ):
         super().__init__()
 
+        # 动态接收输入维度
         self.input = nn.Linear(in_dim, hidden_dim)
 
         self.blocks = nn.ModuleList([
@@ -19,6 +20,7 @@ class ResidualMLP(nn.Module):
                 nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
+                nn.Dropout(0.15), # 添加一点 Dropout 防止过拟合，与双流对齐
                 nn.Linear(hidden_dim, hidden_dim)
             )
             for _ in range(num_layers)
@@ -31,7 +33,3 @@ class ResidualMLP(nn.Module):
         for block in self.blocks:
             x = x + block(x)
         return self.output(x)
-
-# TODO: 用 gMLP block 替换 self.blocks
-# TODO: 在 input 前加入 Fourier Features
-# TODO: 改成 multi-branch 输入（grav / curv 分支）
