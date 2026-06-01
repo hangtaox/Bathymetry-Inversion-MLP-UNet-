@@ -5,6 +5,9 @@ processed_data/
 *.zip
 *.pdf
 
+# 图片
+*.png
+
 code/
 .python
 
